@@ -1,0 +1,399 @@
+---
+title: "Down-regulation of MALAT1 is a hallmark of tissue and peripheral proliferative T cells in COVID-19"
+author: "Shoumit Dey"
+date: "23/03/2021"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+library(Seurat)
+#library(SeuratDisk)
+library(dplyr)
+library(spatstat)
+library(gplots)
+library(corrplot)
+library(AUCell)
+library(SingleCellExperiment)
+#library(customSeuratAnalysis)
+#library(tidyverse)
+exp_path<-"."
+setwd(exp_path)
+```
+Source: Lung transplantation for patients with severe COVID-19
+BY ANKIT BHARAT, MELISSA QUERREY, NIKOLAY S. MARKOV, SAMUEL KIM, CHITARU KURIHARA, RAFAEL GARZA-CASTILLON, ADWAIY MANERIKAR, ALI SHILATIFARD, RADE TOMIC, YULIYA POLITANSKA, HIAM ABDALA-VALENCIA, ANJANA V. YELDANDI, JON W. LOMASNEY, ALEXANDER V. MISHARIN, G. R. SCOTT BUDINGER
+
+SCIENCE TRANSLATIONAL MEDICINE 16 DEC 2020
+
+Some patients with severe COVID-19 develop end-stage pulmonary fibrosis for which lung transplantation may be the only treatment.
+
+
+```{r load & QC}
+GSE158127_T<-readRDS(paste0(exp_path,"/all_T_cells_Bharat_only.rds"))
+
+GSE158127_T <- PercentageFeatureSet(GSE158127_T, pattern = "^MT-", col.name = "percent.mt")
+
+VlnPlot(GSE158127_T, features = c("percent.mt","nCount_RNA","nFeature_RNA"), pt.size = 0.01, group.by = "Cell.Type")
+  
+FeatureScatter(GSE158127_T, feature1 = "nFeature_RNA", feature2 = "nCount_RNA")
+
+# GSE158127_T <- subset(GSE158127_T, subset = percent.mt < 10 & nFeature_RNA < 2300 & nCount_RNA < 3300 & nCount_RNA > 800)
+# 
+# VlnPlot(GSE158127_T, features = c("percent.mt","nCount_RNA","nFeature_RNA"), pt.size = 0.01, group.by = "Cell.Type")
+#   
+# FeatureScatter(GSE158127_T, feature1 = "nFeature_RNA", feature2 = "nCount_RNA")
+
+
+
+```
+
+
+```{r re-analyse}
+
+#Scaling the data - linear transformation
+all.genes <- rownames(GSE158127_T)
+
+GSE158127_T <- FindVariableFeatures(GSE158127_T, selection.method = "vst")
+
+GSE158127_T <- ScaleData(GSE158127_T, features = all.genes)
+#GSE158127_T[["scale.data"]] <- GSE158127_T[["RNA"]]
+
+GSE158127_T <- RunPCA(GSE158127_T, features = VariableFeatures(object=GSE158127_T))
+#
+print(GSE158127_T[["pca"]], dims = 1:5, nfeatures = 5)
+#
+VizDimLoadings(GSE158127_T, dims = 1:2, reduction = "pca")
+#
+DimPlot(GSE158127_T, reduction = "pca")
+
+ElbowPlot(GSE158127_T)
+
+GSE158127_T <- FindNeighbors(GSE158127_T, dims = 1:5)
+#
+GSE158127_T <- FindClusters(GSE158127_T, resolution = 0.2)
+
+GSE158127_T <- RunUMAP(GSE158127_T, dims = 1:5)
+
+DimPlot(GSE158127_T, label = TRUE, label.box = TRUE) 
+VlnPlot(GSE158127_T, features = c("MALAT1","MKI67"))
+############################################################
+```
+
+```{r check_T_cell_markers}
+GSE158127_T <- fn_add_t_cell_modules(GSE158127_T, "RNA")
+FeaturePlot(GSE158127_T, reduction = "umap", features = c("CD8_Tn1","CD8_Tem1","CD8_Trm1","CD8_Temra1","CD8_Tex1","CD8_Tmait1","CD8_Tgd1")) + DimPlot(GSE158127_T, label = TRUE, label.box = TRUE)
+
+FeaturePlot(GSE158127_T, reduction = "umap", features = c("CD4_Tn1","CD4_Tem1","CD4_Th11","CD4_Th171","CD4_Treg1"), combine = TRUE) + DimPlot(GSE158127_T, label = TRUE, label.box = TRUE)
+```
+
+
+```{r AU_cell prep}
+#for graph saving reference
+study<-"GSE158127_T"
+#get count data
+exprMatrix <- GSE158127_T[['RNA']]@data
+
+cellsUMAP<-GSE158127_T@reductions[["umap"]]@cell.embeddings
+plot(cellsUMAP, pch=16, cex=.3)
+#load gmt file
+gmtFile <- "gene_lists_auc.gmt"
+
+geneSets <- getGmt(gmtFile)
+#Let's check how many of these genes are in the expression matrix:
+geneSets <- subsetGeneSets(geneSets, rownames(exprMatrix)) 
+cbind(nGenes(geneSets))
+
+#To ease the interpretation of the tutorial, we will also add the gene-set size into its name:
+geneSets <- setGeneSetNames(geneSets, newNames=paste(names(geneSets), " (", nGenes(geneSets) ,"g)", sep=""))
+
+# Random
+set.seed(321)
+extraGeneSets <- c(
+  GeneSet(sample(rownames(exprMatrix), 50), setName="Random (50g)"),
+  GeneSet(sample(rownames(exprMatrix), 500), setName="Random (500g)"))
+
+countsPerGene <- apply(exprMatrix, 1, function(x) sum(x>0))
+# Housekeeping-like
+extraGeneSets <- c(extraGeneSets,
+                   GeneSet(sample(names(countsPerGene)[which(countsPerGene>quantile(countsPerGene, probs=.95))], 100), setName="HK-like (100g)"))
+
+geneSets <- GeneSetCollection(c(geneSets,extraGeneSets))
+names(geneSets)
+
+gc()
+```
+
+
+```{r AU_Cell build rankings, calculate AUC & explore thresholds }
+#build rankings
+cells_rankings <- AUCell_buildRankings(exprMatrix, nCores=1, plotStats=TRUE)
+cells_rankings
+#calculate AUC
+cells_AUC <- AUCell_calcAUC(geneSets, cells_rankings)
+#explore thresholds
+par(mfrow=c(3,3)) 
+  cells_assignment <- AUCell_exploreThresholds(cells_AUC, plotHist=TRUE, assign=TRUE) 
+  warningMsg <- sapply(cells_assignment, function(x) x$aucThr$comment)
+  warningMsg[which(warningMsg!="")]
+```
+
+```{r select thresholds and graph}
+selectedThresholds <- getThresholdSelected(cells_assignment)
+selectedThresholds[1] <-  0.39
+selectedThresholds[2] <-  0.25
+selectedThresholds[3] <-  0.3
+selectedThresholds[4] <-  0.32
+selectedThresholds[5] <-  0.3
+selectedThresholds[6] <-  0.25
+selectedThresholds[7] <-  0.02
+selectedThresholds[8] <-  0.035
+selectedThresholds[9] <-  0.35
+# selectedThresholds[10] <-  0.5
+# selectedThresholds[11] <-  0.02
+# selectedThresholds[12] <-  0.04
+# selectedThresholds[13] <-  0.4
+
+type<-"selected"
+
+#pdf("D:/GoogleDrive/spatial_leishmania/spatial/SingleCellAnalysis/human/Covid-19/combined/Fig4B.pdf")
+  par(mfrow=c(2,3))
+  AUCell_plotTSNE(tSNE=cellsUMAP, exprMat=exprMatrix, cellsAUC=cells_AUC[1:9,], thresholds=selectedThresholds)
+#dev.off()
+
+save_auc_values<-data.frame(t(cells_AUC@assays@data@listData[["AUC"]]))
+save_auc_values$barcodes<-rownames(save_auc_values)
+#save_auc_values$CD4_all_anti_124g<-save_auc_values$CD4_all_anti..124g.
+
+GSE158127_T <- AddMetaData(GSE158127_T, save_auc_values)
+
+
+```
+
+
+```{r exploring_proliferative_cells}
+#Take cells that have a high AUC score
+GSE158127_T_AUC_pos <- subset(GSE158127_T, subset = CD4_CD8_acorr_common..88g. > 0.39)
+
+#Scaling the data - linear transformation
+all.genes <- rownames(GSE158127_T_AUC_pos)
+
+GSE158127_T_AUC_pos <- FindVariableFeatures(GSE158127_T_AUC_pos, selection.method = "vst")
+
+GSE158127_T_AUC_pos <- ScaleData(GSE158127_T_AUC_pos, features = all.genes)
+#GSE158127_T_AUC_pos[["scale.data"]] <- GSE158127_T_AUC_pos[["RNA"]]
+
+GSE158127_T_AUC_pos <- RunPCA(GSE158127_T_AUC_pos, features = VariableFeatures(object=GSE158127_T_AUC_pos))
+#
+print(GSE158127_T_AUC_pos[["pca"]], dims = 1:5, nfeatures = 5)
+#
+VizDimLoadings(GSE158127_T_AUC_pos, dims = 1:2, reduction = "pca")
+#
+DimPlot(GSE158127_T_AUC_pos, reduction = "pca")
+
+ElbowPlot(GSE158127_T_AUC_pos)
+
+GSE158127_T_AUC_pos <- FindNeighbors(GSE158127_T_AUC_pos, dims = 1:15)
+#
+GSE158127_T_AUC_pos <- FindClusters(GSE158127_T_AUC_pos, resolution = 0.4)
+
+GSE158127_T_AUC_pos <- RunUMAP(GSE158127_T_AUC_pos, dims = 1:15)
+
+DimPlot(GSE158127_T_AUC_pos, label = TRUE, label.box = TRUE) 
+```
+
+```{r doublets_by_simulation}
+library(BiocSingular)
+library(scDblFinder)
+set.seed(100)
+
+GSE158127_T_AUC_pos_sce <- as.SingleCellExperiment(GSE158127_T_AUC_pos)
+
+library(scuttle)
+sce <- logNormCounts(GSE158127_T_AUC_pos_sce)
+
+library(scran)
+dec <- modelGeneVar(GSE158127_T_AUC_pos_sce)
+hvgs <- getTopHVGs(dec, n=1000)
+
+library(scater)
+set.seed(1002)
+GSE158127_T_AUC_pos_sce <- runPCA(GSE158127_T_AUC_pos_sce, ncomponents=10, subset_row=hvgs)
+GSE158127_T_AUC_pos_sce <- runTSNE(GSE158127_T_AUC_pos_sce, dimred="PCA")
+
+# Setting up the parameters for consistency with denoisePCA();
+# this can be changed depending on your feature selection scheme.
+dbl.dens <- computeDoubletDensity(GSE158127_T_AUC_pos_sce, subset.row=hvgs)
+   # d=ncol(reducedDim(GSE158127_T_AUC_pos_sce)))
+plotTSNE(GSE158127_T_AUC_pos_sce, colour_by=I(log1p(dbl.dens)))
+
+GSE158127_T_AUC_pos_sce$DoubletScore <- dbl.dens
+
+plotTSNE(GSE158127_T_AUC_pos_sce, colour_by="DoubletScore")
+
+dbl.calls <- doubletThresholding(data.frame(score=dbl.dens),
+    method="griffiths", returnType="call")
+summary(dbl.calls)
+
+plotColData(GSE158127_T_AUC_pos_sce,  y="DoubletScore", colour_by=I(dbl.calls))
+
+plotColData(GSE158127_T_AUC_pos_sce, y="DoubletScore", colour_by=I(dbl.calls))
+
+extract_meta <- data.frame(GSE158127_T_AUC_pos_sce@colData)
+#extract_meta <- data.frame(extract_meta[, "DoubletScore"])
+
+GSE158127_T_AUC_pos <- AddMetaData(GSE158127_T_AUC_pos, metadata = extract_meta)
+
+plotColData(GSE158127_T_AUC_pos_sce, y="DoubletScore", colour_by=I(dbl.calls)) + FeaturePlot(GSE158127_T_AUC_pos, features = "DoubletScore")
+
+GSE158127_T_AUC_pos <- subset(GSE158127_T_AUC_pos, subset = DoubletScore < 2.5)
+DimPlot(GSE158127_T_AUC_pos, label = TRUE, label.box = TRUE) 
+```
+
+```{r check_T_cell_markers}
+GSE158127_T_AUC_pos <- fn_add_t_cell_modules(GSE158127_T_AUC_pos, "RNA")
+FeaturePlot(GSE158127_T_AUC_pos, reduction = "umap", features = c("CD8_Tn1","CD8_Tem1","CD8_Trm1","CD8_Temra1","CD8_Tex1","CD8_Tmait1","CD8_Tgd1")) + DimPlot(GSE158127_T_AUC_pos, label = TRUE, label.box = TRUE)
+
+FeaturePlot(GSE158127_T_AUC_pos, reduction = "umap", features = c("CD4_Tn1","CD4_Tem1","CD4_Th11","CD4_Th171","CD4_Treg1"), combine = TRUE) + DimPlot(GSE158127_T_AUC_pos, label = TRUE, label.box = TRUE)
+```
+
+```{r markers_by_cluster}
+
+    
+    GSE158127_T_AUC_pos <- SetIdent(GSE158127_T_AUC_pos, value = GSE158127_T_AUC_pos$seurat_clusters)
+    
+    GSE158127_T_AUC_pos.cluster.markers <- FindAllMarkers(GSE158127_T_AUC_pos, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+    
+
+    
+    
+    write.csv(GSE158127_T_AUC_pos.cluster.markers, paste0(exp_path, "GSE158127_T_AUC_pos_all_markers_per_ident.csv"))
+    
+    VlnPlot(GSE158127_T_AUC_pos, features = "MALAT1") + NoLegend()
+    
+
+
+```
+
+
+```{r prep_figure4_figures_here}
+#Fig4
+hist(GSE158127_T$CD4_CD8_acorr_common..88g., 
+     col="lightblue1",
+     freq = FALSE,
+     main = "Area under curve - gene list",
+     xlab="AUC values (CD4/CD8 MALAT1 acorr - 88 genes)", 
+     ylab = "Density")
+lines(density(GSE158127_T$CD4_CD8_acorr_common..88g.))
+polygon(density(GSE158127_T$CD4_CD8_acorr_common..88g.), col=rgb(1,0,1,.2))
+        
+
+#Fig4b
+auc_plot <- FeaturePlot(GSE158127_T, features = c("CD4_CD8_acorr_common..88g."), min.cutoff = selectedThresholds[1], cols = c("grey", "red")) + ggtitle(label = "Area under curve", subtitle = "CD4/CD8 MALAT1 acorr (88 genes)") + NoLegend()
+
+
+#Fig4c
+FeaturePlot(GSE158127_T, features = c("MKI67","MALAT1"), ncol = 1) 
+
+#Fig4d
+# top10 <- GSE158127_T_AUC_pos.cluster.markers %>%
+#   group_by(cluster) %>%
+#     top_n(n = 10, wt = avg_log2FC) 
+    GSE158127_T_AUC_pos.cluster.markers %>%
+      group_by(cluster) %>%
+        slice_max(n = 10, order_by = avg_log2FC) -> top10
+
+
+DoHeatmap(GSE158127_T_AUC_pos, features = top10$gene) + NoLegend() + theme(text = element_text(size = 12))
+
+#Fig4c
+FeaturePlot(GSE158127_T_AUC_pos, features = c("MKI67","MALAT1"), ncol = 1) 
+
+#Figure 4 supplementary
+
+p <- FeaturePlot(GSE158127_T_AUC_pos, features = c("TRBC2","CD8A","CD4"), combine = FALSE)
+for(i in 1:length(p)) {
+  p[[i]] <- p[[i]] + NoLegend() #+ NoAxes()
+}
+next_slot <- length(p)+1
+p[[next_slot]] <- DimPlot(GSE158127_T_AUC_pos, label = TRUE, label.box = TRUE) + NoLegend()
+cowplot::plot_grid(plotlist = p, ncol = 2) 
+
+#Figure 4
+VlnPlot(GSE158127_T_AUC_pos, features = "MALAT1", ncol = 1) +  theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank(), panel.background=element_rect(fill = "white") )
+
+#CellCycleScoring for entire object
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+GSE158127_T <- CellCycleScoring(GSE158127_T, s.features = s.genes, g2m.features = g2m.genes)
+
+FeatureScatter(GSE158127_T, feature1 = "S.Score", feature2 = "G2M.Score")
+
+all_cells <- FeatureScatter(GSE158127_T, feature1 = "S.Score", feature2 = "MALAT1", group.by = "Phase") + NoLegend() +
+  FeatureScatter(GSE158127_T, feature1 = "G2M.Score", feature2 = "MALAT1", group.by = "Phase")
+
+VlnPlot(GSE158127_T, features = "MALAT1", group.by = "Phase" ) + NoLegend()
+
+FeatureScatter(GSE158127_T, feature1 = "MKI67", feature2 = "MALAT1")
+
+#CellCycleScoring for AUC pos object
+GSE158127_T_AUC_pos <- CellCycleScoring(GSE158127_T_AUC_pos, s.features = s.genes, g2m.features = g2m.genes)
+
+FeatureScatter(GSE158127_T_AUC_pos, feature1 = "S.Score", feature2 = "G2M.Score")
+
+auc_pos_cells <- FeatureScatter(GSE158127_T_AUC_pos, feature1 = "S.Score", feature2 = "MALAT1", group.by = NULL) + NoLegend() +
+  FeatureScatter(GSE158127_T_AUC_pos, feature1 = "G2M.Score", feature2 = "MALAT1", group.by = NULL) +  theme(axis.text.y = element_blank(), axis.title.y = element_blank(), axis.ticks.y = element_blank(), panel.background=element_rect(fill = "white") )
+
+FeatureScatter(GSE158127_T_AUC_pos, feature1 = "MKI67", feature2 = "MALAT1")
+DimPlot(GSE158127_T_AUC_pos, group.by = "Sample.Name") + DimPlot(GSE158127_T_AUC_pos, group.by = "COVID.19")
+#vlnplot malat
+#idents = c("S","G2M")
+GSE158127_T <- SetIdent(GSE158127_T, value = GSE158127_T$Phase)
+GSE158127_T_AUC_pos <- SetIdent(GSE158127_T_AUC_pos, value = GSE158127_T$Phase) 
+parent_obj <- VlnPlot(GSE158127_T, features = c("MALAT1"), ncol = 1) + theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank(), panel.background=element_rect(fill = "white") ) 
+daughter_obj <- RidgePlot(GSE158127_T_AUC_pos, features = "MALAT1", group.by = "Phase", idents = c("S","G2M")) +  theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank(), panel.background=element_rect(fill = "white") )
+GSE158127_T <- SetIdent(GSE158127_T, value = GSE158127_T$seurat_clusters)
+GSE158127_T_AUC_pos <- SetIdent(GSE158127_T_AUC_pos, value = GSE158127_T_AUC_pos$seurat_clusters) 
+parent_obj 
+daughter_obj
+
+DimPlot(GSE158127_T_AUC_pos, group.by = "Phase") + ggtitle(label = "Cellcycle Phase", subtitle = "Bharat et al - AUC>0.39 only") + theme(plot.subtitle=element_text(hjust=0.5))
+
+
+```
+
+```{r test_chunk}
+require(stats)
+
+gene_table <- data.frame(t(GSE158127_T_AUC_pos@assays[["RNA"]]["MALAT1" ,]))
+gene_table$barcode <- rownames(gene_table)
+meta_table <- GSE158127_T_AUC_pos@meta.data
+meta_table$barcode <- rownames(GSE158127_T_AUC_pos@meta.data)
+
+
+#JOIN gene and meta table
+gene_meta <- sqldf("SELECT gene_table.barcode, MALAT1, meta_table.'G2M.Score' as G2Mscore, meta_table.'S.Score' as Sscore
+                    FROM gene_table
+                    INNER JOIN meta_table
+                    ON gene_table.barcode = meta_table.barcode")
+
+cor.test(gene_meta$MALAT1, gene_meta$G2Mscore)
+cor.test(gene_meta$MALAT1, gene_meta$Sscore)
+
+write.csv(gene_meta, paste0(exp_path,"CellCycleScoring_GSE158127_T_AUC_pos.csv"))
+
+# sp <- FeatureScatter(GSE158127_T_AUC_pos, feature1 = "S.Score", feature2 = "MALAT1", group.by = NULL) + NoLegend()
+# reg<-lm(Sscore ~ MALAT1, data = gene_meta)
+# reg
+# coeff=coefficients(reg)
+# coeff
+# # Equation of the line : 
+# eq = paste0("y = ", round(coeff[2],1), "*x + ", round(coeff[1],1))
+# # Plot
+# sp + geom_abline(intercept = coeff[1], slope = coeff[2], color="red",linetype="dashed", size=1.5)#+
+#  ggtitle(eq)
+# Change line type, color and size
+#sp + geom_abline(intercept = 37, slope = -5, color="red", 
+   #              linetype="dashed", size=1.5)#+
+  #ggtitle(eq)
+```

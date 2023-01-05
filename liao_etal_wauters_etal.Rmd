@@ -1,0 +1,752 @@
+---
+title: "Down-regulation of MALAT1 is a hallmark of tissue and peripheral proliferative T cells in COVID-19"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{introduction}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+
+```{r setup}
+library(Seurat)
+library(sqldf)
+library(dplyr)
+library(AUCell)
+library(SingleCellExperiment)
+library(mclust)
+library(slingshot)
+library(RColorBrewer)
+library(sqldf)
+library(ggpubr)
+library(tradeSeq)
+
+library(data.table)
+library(GSEABase)
+library(plotly)
+
+#library(GEOquery)
+
+library(spatstat)
+library(gplots)
+library(corrplot)
+library(stringr)
+
+library(VennDiagram)
+library(grid)#for printing PDFs off VennDiagram
+library(reshape2)
+library(ggplot2)
+
+#library(destiny)
+
+#library(glmGamPoi)
+#define study path#
+exp_path<-"./"
+
+
+
+study_name<-"combined"
+cell_type<-"T"
+```
+
+```{r load_all_RDS}
+seuratObjList<-list()
+#load all RDS here
+				
+
+seuratObjList[["lambrechts_T"]]<-readRDS("T_NKT_seurat.rds")
+nCount = colSums(x = seuratObjList[["lambrechts_T"]], slot = "counts")  # nCount_RNA
+nFeature = colSums(x = GetAssayData(object = seuratObjList[["lambrechts_T"]], slot = "counts") > 0)  # nFeatureRNA
+seuratObjList[["lambrechts_T"]]$nCount_RNA<-nCount
+seuratObjList[["lambrechts_T"]]$nFeature_RNA<-nFeature
+seuratObjList[["lambrechts_T"]]<-RenameCells(seuratObjList[["lambrechts_T"]], add.cell.id = "t_lambrechts", for.merge = FALSE)
+
+seuratObjList[["lambrechts_T"]]<-SetIdent(seuratObjList[["lambrechts_T"]], value=seuratObjList[["lambrechts_T"]]$Disease)
+#take only COVID19 cells from the Wauters et al 
+seuratObjList[["lambrechts_T"]]<-subset(seuratObjList[["lambrechts_T"]], idents="COVID19")
+seuratObjList[["lambrechts_T"]]
+DefaultAssay(seuratObjList[["lambrechts_T"]])<-"RNA"
+seuratObjList[["lambrechts_T"]]$study<-"Wauters et al"
+
+
+#gse145926 all T cells
+seuratObjList[["gse145926_T"]]<-readRDS("gse145926_T_bal.rds")
+seuratObjList[["gse145926_T"]]<-RenameCells(seuratObjList[["gse145926_T"]], add.cell.id = "T_145926", for.merge = FALSE)
+DefaultAssay(seuratObjList[["gse145926_T"]])<-"RNA"
+seuratObjList[["gse145926_T"]]$study<-"Liao et al"
+
+
+```
+
+Integrate dataset using CCA
+```{r find_integration_anchors}
+
+##perform standard preprocessing on each object
+for (i in 1:length(seuratObjList)) {
+  seuratObjList[[i]]
+  seuratObjList[[i]] <- PercentageFeatureSet(seuratObjList[[i]], pattern = "^MT-", col.name = "percent.mt")
+  seuratObjList[[i]] <- subset(seuratObjList[[i]], subset = percent.mt < 10)
+  seuratObjList[[i]] <- PercentageFeatureSet(seuratObjList[[i]], pattern = "^RPS", col.name = "percent.rps")
+  seuratObjList[[i]] <- PercentageFeatureSet(seuratObjList[[i]], pattern = "^RPL", col.name = "percent.rpl")
+}
+
+#SCTransform the seurat objects 
+seuratObjList <- lapply(X = seuratObjList, FUN = SCTransform, method = "glmGamPoi", 
+                        vars.to.regress = c(
+                          "percent.mt",
+                          "percent.rps",
+                          "percent.rpl",
+                          "nCount_RNA",
+                          "nFeature_RNA"
+                          ), verbose = TRUE)
+
+###Label transfer using Wauters et al as reference
+seuratObjList[["lambrechts_T"]] <- RunPCA(seuratObjList[["lambrechts_T"]], npcs = 30, verbose = FALSE)
+bal.anchors <- FindTransferAnchors(reference = seuratObjList[["lambrechts_T"]], query = seuratObjList[["gse145926_T"]],
+    dims = 1:30, reference.reduction = "pca")
+predictions <- TransferData(anchorset = bal.anchors, refdata = seuratObjList[["lambrechts_T"]]$CellType1,
+    dims = 1:30)
+seuratObjList[["gse145926_T"]] <- AddMetaData(seuratObjList[["gse145926_T"]], metadata = predictions)
+seuratObjList[["gse145926_T"]]$CellType1 <- seuratObjList[["gse145926_T"]]$predicted.id
+
+
+#Start integration workflow 
+features <- SelectIntegrationFeatures(object.list = seuratObjList, nfeatures = 3000)
+seuratObjList <- PrepSCTIntegration(object.list = seuratObjList, anchor.features = features)
+
+immune.anchors <- FindIntegrationAnchors(object.list = seuratObjList, normalization.method = "SCT", 
+                                         anchor.features = features)
+
+integrated_sctransformed <- IntegrateData(anchorset = immune.anchors, normalization.method = "SCT")#, features.to.integrate = all.feature)
+
+nrow(integrated_sctransformed[["integrated"]]@scale.data)
+
+
+```
+
+
+```{r explore_metadata}
+colnames(integrated_sctransformed@meta.data)
+
+integrated_sctransformed$severity_combined <- ifelse(is.na(integrated_sctransformed$severity), integrated_sctransformed$PatientType1, integrated_sctransformed$severity)
+#
+table(integrated_sctransformed@meta.data$severity_combined)
+table(integrated_sctransformed@meta.data$CellType1)
+
+integrated_sctransformed@meta.data <- select(integrated_sctransformed@meta.data, c("orig.ident","nCount_RNA","nFeature_RNA","percent.rps","percent.rpl",        "percent.rrna","nCount_SCT","nFeature_SCT","severity_combined", "study", "CellType1"))
+
+colnames(integrated_sctransformed@meta.data)
+
+saveRDS(integrated_sctransformed, paste0(exp_path,"/integrated_liao_lambrecht_T_cells_08072022.rds"))
+```
+
+
+run pca and clustering
+```{r pca_and_louvain_cluster}
+rm(integrated_sctransformed)
+seuratObj<-readRDS(paste0(exp_path,"/integrated_liao_lambrecht_T_cells_08072022.rds"))
+
+
+
+dims_to_use<-15
+DefaultAssay(seuratObj) <- "integrated"
+seuratObj <- RunPCA(seuratObj, verbose = FALSE)
+seuratObj <- FindNeighbors(seuratObj, reduction = "pca", dims = 1:dims_to_use)
+seuratObj <- FindClusters(seuratObj, verbose = FALSE, resolution = 0.1)
+seuratObj <- RunUMAP(seuratObj, reduction = "pca", dims = 1:dims_to_use)
+#seuratObj <- RunTSNE(seuratObj, reduction = "pca", dims = 1:5)
+
+cluster_plot<-DimPlot(seuratObj, label=TRUE, label.box=TRUE) + NoLegend()
+study_plot<-DimPlot(seuratObj, group.by="study")
+severity_plot<-DimPlot(seuratObj, group.by = "severity_combined")
+cell_type_legacy_plot<-DimPlot(seuratObj, group.by = "CellType1")
+orig_plot <- DimPlot(seuratObj, group.by = "orig.ident", label = TRUE, label.size = 3) + NoLegend()
+
+#DefaultAssay(seuratObj)<-"SCT"
+    
+    
+```
+
+Define functions here
+```{r functions_live_here}
+#Check gene enrichment scores
+fn_add_t_cell_modules <- function(obj, assay) {
+
+  DefaultAssay(obj) <- assay
+
+  cd8 <- c("CD8A","CD8B")
+  CD8_Tn <- c("CCR7","TCF7","LEF1","KLF2","MAL","MYC")
+  CD8_Tem <- c("GZMK","GZMM","GZMH","NKG7","CD74","CD38","GZMA","IFNG")
+  CD8_Trm <- c("ZNF683","ITGAE","ITGA1","XCL1","XCL2","JAML")
+  CD8_Temra <- c("GZMM","GZMH","NKG7","CX3CR1","FGFBP2","FCGR3A","SPON2","KLRG1","PRF1","TRGC2")
+  CD8_Tex <- c("CD74","CD38","GZMA","GNLY","GZMB","HAVCR2","LAG3","CTLA4","TIGIT","ENTPD1","TOX2")
+  CD8_Tmait <- c("SLC4A10","CCR6","PRSS35","IL4I1","KLRB1","RORC")
+  CD8_Tgd <- c("TRDC","TRGC2","TRG-AS1","TRDV1","KIR2DL4","KIR3DL2")
+  
+  obj <- AddModuleScore(object = obj, features = list(CD8_Tn) , ctrl = 100, name = 'CD8_Tn')
+  obj <- AddModuleScore(object = obj, features = list(CD8_Tem) , ctrl = 100, name = 'CD8_Tem')
+  obj <- AddModuleScore(object = obj, features = list(CD8_Trm) , ctrl = 100, name = 'CD8_Trm')
+  obj <- AddModuleScore(object = obj, features = list(CD8_Temra) , ctrl = 100, name = 'CD8_Temra')
+  obj <- AddModuleScore(object = obj, features = list(CD8_Tex) , ctrl = 100, name = 'CD8_Tex')
+  obj <- AddModuleScore(object = obj, features = list(CD8_Tmait) , ctrl = 100, name = 'CD8_Tmait')
+  obj <- AddModuleScore(object = obj, features = list(CD8_Tgd) , ctrl = 100, name = 'CD8_Tgd')
+  
+
+  
+  
+  cd4 <- c("CD4")
+  CD4_Tn <- c("CCR7","TCF7","LEF1","KLF2","PLAC8","ICAM2","MYC")
+  CD4_Tem <- c("GZMH","ANKRD28","ANXA1","EOMES","GZMK","HLA-DPB1","HLA-DMA","ANXA2","GZMA","IFNG","GZMB","PRF1")
+  CD4_Th1 <- c("HLA-DMA","ANXA2","GZMA","IFNG","TBX21","RUNX3", "CCR1", "CCR5", "NKG7","GZMB","PRF1", "GNLY", "LAG3", "HAVCR2", "PDCD1", "IL10" )
+  CD4_Th17 <- c("RORC","IL17F","IL17A","CCR6","ADAM12","IL6","TNF","IL23R")
+  CD4_Treg <- c("FOXP3","IL12RA","IKZF2","TNFRSF9","IL1R2","KAIR2","IL1R1")
+  
+  obj <- AddModuleScore(object = obj, features =  list(CD4_Tn), ctrl = 100, name = 'CD4_Tn')
+  obj <- AddModuleScore(object = obj, features =  list(CD4_Tem), ctrl = 100, name = 'CD4_Tem')
+  obj <- AddModuleScore(object = obj, features =  list(CD4_Th1), ctrl = 100, name = 'CD4_Th1')
+  obj <- AddModuleScore(object = obj, features =  list(CD4_Th17), ctrl = 100, name = 'CD4_Th17')
+  obj <- AddModuleScore(object = obj, features =  list(CD4_Treg), ctrl = 100, name = 'CD4_Treg')
+
+  
+  return(obj)
+}
+#fetch lincRNA
+fetch_lincrna <- function(datasetname){
+  #currently hardcoded
+  datasetname="hsapiens_gene_ensembl"
+  #create ensembl connection to dataset
+  ensembl <- biomaRt::useMart("ensembl",dataset=datasetname)
+  #get attributes filtered by lincRNA
+  lincrna <- biomaRt::getBM(attributes= c('ensembl_gene_id',
+                                 'external_gene_name'),
+                   filters = "biotype",
+                   value = 'lncRNA',
+                   mart = ensembl)
+  lincrna$external_gene_name[lincrna$external_gene_name==''] <- lincrna$ensembl_gene_id
+  lincrna
+}
+
+#function to find highly expressed LincRNAs
+find_highly_expressed_lincRNA <- function(current_object, features_to_select){
+  #currently hardcoded
+  exprMatrix="hsapiens_gene_ensembl"
+  variable_features<-2000
+  #create ensembl connection to dataset
+  lincRNA<-fetch_lincrna()
+  # if(studyName=="GSE155249"){
+  #   lincRNA$external_gene_name<-paste0("GRCh38------", lincRNA$external_gene_name)
+  # }
+  # #print(head(lincRNA$lincRNA.external_gene_name))
+  #Find Variable features in Seurat Object
+  #now find variable features
+  current_object <- Seurat::FindVariableFeatures(current_object, selection.method = "vst", nfeatures = variable_features)
+  variable_features <- as.data.frame(Seurat::VariableFeatures(object = current_object))
+  colnames(variable_features)<-c("gene")
+  #access the meta features to obtain mean expression values
+  current_obj_linc_high <- current_object[["RNA"]]@meta.features
+  #columname for SQL query
+  current_obj_linc_high$genes <- row.names(current_obj_linc_high)
+  current_obj_linc_high$mean <- current_obj_linc_high$vst.mean
+
+  mean_of_means<-mean(current_obj_linc_high$vst.mean)
+
+  current_obj_linc_high <- sqldf::sqldf(sprintf("SELECT DISTINCT genes, mean
+                                                      FROM current_obj_linc_high
+                                                      INNER JOIN lincRNA
+                                                      WHERE current_obj_linc_high.genes IN (SELECT external_gene_name FROM lincRNA)
+                                                      AND mean > %f
+                                                      ORDER BY mean DESC
+                                                      LIMIT %f", mean_of_means, features_to_select))
+
+  current_obj_linc_variable <- sqldf::sqldf("SELECT lincRNA.external_gene_name as gene
+                                            FROM lincRNA
+                                            WHERE gene IN (SELECT gene FROM variable_features)")
+
+
+  current_obj_linc<-list()
+
+  current_obj_linc[["highly_expressed_lincRNA"]]<-current_obj_linc_high
+  current_obj_linc[["variable_lincRNA"]]<-current_obj_linc_variable
+  current_obj_linc[["variable_features"]]<-variable_features
+  current_obj_linc[["seuratObj"]]<-current_object
+  return(current_obj_linc)
+
+}
+######
+#function correlation
+######
+fn_get_corr_mat <- function(obj, gene_name){
+  correlation_df_list<-list()
+
+
+  mat_count<-as.matrix(obj[['SCT']]@data)
+
+  #search correlations for first lincRNA only - hardcoded atm
+  #gene_name<-X[1]
+  type<-"spearman"
+
+  #get 'gene of interest' expression of all cells
+  count_gene<-mat_count[gene_name,]
+
+  correlation_mat<-matrix(nrow = dim(mat_count)[1], ncol = 2)
+  #add rownames
+  rownames(correlation_mat) <- rownames(mat_count)
+  # Create a nested loop
+  for(row in 1:nrow(mat_count)) {
+    correlation<-stats::cor.test(count_gene, mat_count[row,], method = type)
+    correlation_mat[row,1]<-correlation$estimate
+    correlation_mat[row,2]<-correlation$p.value
+  }
+  correlation_mat<-as.data.frame(correlation_mat)
+  colnames(correlation_mat)<-c("corr_estimate","pvalue")
+  correlation_mat$gene<-rownames(correlation_mat)
+  #discard pvalues greater than 0.05 and correlations below 0.1
+  correlation_df<-sqldf::sqldf("SELECT gene, corr_estimate, pvalue
+                                FROM correlation_mat
+                                WHERE pvalue < 0.05
+                                AND corr_estimate > 0.1
+                                ORDER BY corr_estimate DESC")
+
+  anti_correlation_df<-sqldf::sqldf("SELECT gene, corr_estimate, pvalue
+                                FROM correlation_mat
+                                WHERE pvalue < 0.05
+                                AND corr_estimate < -0.1
+                                ORDER BY corr_estimate ASC")
+  #write.table(correlation_mat, file = paste0(exp_path, "All_CD8_T_PBMC_Malat1_Vs_allGene_flu_corr.csv"), sep=",")
+  correlation_df_list[[paste0("corr_", gene_name)]]<-correlation_df
+  correlation_df_list[[paste0("acorr_", gene_name)]]<-anti_correlation_df
+  list_corr_mat <- correlation_df_list
+  return(list_corr_mat)
+}
+```
+
+Module scores for all T cells
+```{r modules_scores}
+
+seuratObj <- fn_add_t_cell_modules(seuratObj, "SCT")
+FeaturePlot(seuratObj, reduction = "umap", features = c("CD8_Tn1","CD8_Tem1","CD8_Trm1","CD8_Temra1","CD8_Tex1","CD8_Tmait1","CD8_Tgd1"))
+ggsave(paste0(exp_path, "seuratObj_CD8_scores.pdf"), limitsize = FALSE, width = 5, height = 5)
+
+FeaturePlot(seuratObj, reduction = "umap", features = c("CD4_Tn1","CD4_Tem1","CD4_Th11","CD4_Th171","CD4_Treg1"), combine = TRUE) 
+#+ cluster_plot + cell_type_legacy_plot
+ggsave(paste0(exp_path, "seuratObj_CD4_scores.pdf"), limitsize = FALSE, width = 5, height = 5)
+
+cluster_plot 
+ggsave(paste0(exp_path, "seuratObj_clusters.pdf"), limitsize = FALSE, width = 5, height = 5)
+
+severity_plot 
+ggsave(paste0(exp_path, "seuratObj_severity.pdf"), limitsize = FALSE, width = 7, height = 5)
+
+study_plot 
+ggsave(paste0(exp_path, "seuratObj_study_plot.pdf"), limitsize = FALSE, width = 7, height = 5)
+
+cell_type_legacy_plot
+ggsave(paste0(exp_path, "seuratObj_study_labels.pdf"), limitsize = FALSE, width = 7, height = 5)
+
+orig_plot
+ggsave(paste0(exp_path, "seuratObj_orig_plot.pdf"), limitsize = FALSE, width = 5, height = 5)
+
+FeaturePlot(seuratObj, reduction = "umap", features = c("CD4","CD8A")) #+ FeaturePlot(seuratObj, reduction = "umap", features = c("CD8A"))
+ggsave(paste0(exp_path, "seuratObj_CD4_CD8.pdf"),  limitsize = FALSE, width = 10, height = 5)
+
+
+#####################################
+v1 <- VlnPlot(seuratObj, features = "MALAT1", group.by = "seurat_clusters", pt.size = 0.07) + NoLegend() + xlab(element_blank())
+v1
+ggsave(paste0(exp_path, "seuratObj_Malat_cluster_violins.pdf"), limitsize = FALSE, width = 5, height = 5)
+v2 <- VlnPlot(seuratObj, features = "MALAT1", group.by = "CellType1", pt.size = 0.07) + NoLegend() + xlab(element_blank())
+v2
+ggsave(paste0(exp_path, "seuratObj_Malat_labels_violins.pdf"), limitsize = FALSE, width = 7.5, height = 5)
+####text for figure 1c
+seuratObj<-SetIdent(seuratObj, value="study")
+obj<-subset(seuratObj, idents="Wauters et al")
+write.csv(prop.table(table(obj$severity_combined, obj$CellType1)), paste0(exp_path,"figure1c_overrepresented_wauters.csv"))
+
+#DATA FOR FIGURE 1E, Now plotted in Graphpad
+Idents(seuratObj) <- seuratObj$study
+v1 <- VlnPlot(seuratObj, features = c("MALAT1"), group.by = "severity_combined", pt.size = 0.07, idents = "Liao et al", cols = c("aquamarine4","chocolate3","brown4")) + NoLegend() + xlab(element_blank())
+v1a <- VlnPlot(seuratObj, features = c("MALAT1"), group.by = "CellType1", pt.size = 0.07, idents = "Liao et al", split.by = "severity_combined")
+
+v2 <- VlnPlot(seuratObj, features = c("MALAT1"), group.by = "severity_combined", pt.size = 0.07, idents = "Wauters et al",cols = c("chocolate3","brown4")) + NoLegend() + xlab(element_blank())
+v2a <- VlnPlot(seuratObj, features = c("MALAT1"), group.by = "CellType1", pt.size = 0.07, idents = "Wauters et al", split.by = "severity_combined")
+#use the following data
+write.csv(v1$data, paste0(exp_path, "liao_all_together_malat.csv"))
+write.csv(v1a$data, paste0(exp_path, "liao_by_cells_malat.csv"))
+write.csv(v2$data, paste0(exp_path, "wauters_all_together_malat.csv"))
+write.csv(v2a$data, paste0(exp_path, "wauters_by_cells_malat.csv"))
+
+Idents(seuratObj) <- seuratObj$seurat_clusters
+ggarrange(v1, v2, widths = c(2,1)) 
+ggsave(paste0(exp_path, "seuratObj_Malat_severity_violins.pdf"), limitsize = FALSE, width = 7.5, height = 5)
+rm(v1, v2)
+
+barplot(prop.table(table(seuratObj$severity_combined)), ylab = "Proportion of all cells") 
+
+#print off highly expressed lincRNAs
+gene_list<-c("NEAT1","CYTOR","PSMB1","ZFAS1","LINC01871","MIR4435-2HG","SNHG8","LINC02446","LINC00861")
+plot_list<-list()
+Idents(seuratObj) <- seuratObj$study
+for(gene in gene_list){
+  v1 <- VlnPlot(seuratObj, features = gene, group.by = "severity_combined", pt.size = 0.07, idents = "Liao et al", cols = c("aquamarine4","chocolate3","brown4")) + NoLegend() + xlab(element_blank()) 
+  v2 <- VlnPlot(seuratObj, features = gene, group.by = "severity_combined", pt.size = 0.07, idents = "Wauters et al",cols = c("chocolate3","brown4")) + NoLegend() + xlab(element_blank())
+  ggarrange(v1, v2, widths = c(2,1))
+  ggsave(paste0(exp_path, "seuratObj_",gene,"_severity_violins.pdf"), limitsize = FALSE, width = 7.5, height = 5)
+  text1 <- paste0(gene, "_1")
+  text2 <- paste0(gene, "_2")
+  plot_list[[text1]] <- v1
+  plot_list[[text2]] <- v2  
+}
+rm(v1, v2)
+Idents(seuratObj) <- seuratObj$seurat_clusters
+
+
+```
+
+```{r markers_by_cluster}
+
+    p0 <- DimPlot(seuratObj, reduction = "umap", ncol = 2, label = TRUE, group.by = "orig.ident") + NoLegend()
+    
+    p3 <- FeaturePlot(seuratObj, reduction = "umap", features = c("CD3E","CD8A","CD4")) 
+    p4 <- DimPlot(seuratObj, reduction = "umap", ncol = 2, label = TRUE) + NoLegend()
+    p3+p4
+    
+    
+    seuratObj <- SetIdent(seuratObj, value = seuratObj$seurat_clusters)
+    #######################################################################
+    seuratObj <- PrepSCTFindMarkers(object = seuratObj)
+    
+    seuratObj.cluster.markers <- FindAllMarkers(seuratObj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+    
+    seuratObj.cluster.markers %>%
+      group_by(cluster) %>%
+        slice_max(n = 2, order_by = avg_log2FC)
+    
+    seuratObj.cluster.markers %>%
+      group_by(cluster) %>%
+        top_n(n = 10, wt = avg_log2FC) -> top10
+    DoHeatmap(seuratObj, features = top10$gene) + NoLegend() + theme(text = element_text(size = 4))
+    
+    write.csv(seuratObj.cluster.markers, paste0(exp_path, "all_markers_per_ident.csv"))
+
+    
+    # seuratObj$severity_combined <- factor(seuratObj$severity_combined, levels = c("healthy", "mild", "moderate", "severe"))    
+    # pdf(paste0(exp_path, "FigS1.pdf"))        
+    #   VlnPlot(seuratObj, features = "MALAT1", group.by = "severity_combined", split.by = "study", pt.size = 0.01, cols = c("coral3","turquoise3")) + 
+    #         theme_bw() + 
+    #         xlab("MALAT1") +
+    #         theme(legend.position="top") + 
+    #         ggtitle("") 
+    # dev.off()  
+    
+    pdf(paste0(exp_path, "MalatVsMKI67.pdf"))  
+      seuratObj<-SetIdent(seuratObj, value = "severity_combined")
+      coloring<-c("limegreen","lightskyblue1","sienna1","deeppink4")
+      FeatureScatter(seuratObj, feature1 = "MALAT1", feature2 = "MKI67", cols = coloring) +
+              theme_bw() + 
+              ggtitle("") +
+              theme(legend.position="top", legend.title = element_blank(), legend.spacing.x = unit(0.25, 'cm'))
+      
+      seuratObj<-SetIdent(seuratObj, value = "seurat_clusters")
+    dev.off()
+```
+show highly expressed LincRNAs
+```{r highly_expressed_LincRNA}
+DefaultAssay(seuratObj)<-"RNA"
+
+how_many<-100
+
+lincRNA_in_study<-find_highly_expressed_lincRNA(seuratObj, how_many)
+
+highly_expressed_lincRNA<-lincRNA_in_study[["highly_expressed_lincRNA"]]
+#print top highly expressed lincRNA
+head(highly_expressed_lincRNA, 15)
+
+highly_variable_lincRNA<-lincRNA_in_study[["variable_lincRNA"]]
+#print highly variable lincRNA
+head(highly_variable_lincRNA, 20)
+#store top x variable features
+variable_features<-lincRNA_in_study[["variable_features"]]
+
+seuratObj <- lincRNA_in_study[["seuratObj"]]
+
+DefaultAssay(seuratObj)<-"SCT"
+
+#Figure 1a 
+p1 <- VlnPlot(seuratObj, features = head(highly_expressed_lincRNA$gene, 10), pt.size=0.01, group.by = "study", stack = TRUE)
+p1 <- p1 + NoLegend() + ylab(element_blank()) #+ axis(cex.axis=0.5)
+p1
+ggsave(paste0(exp_path, "Figure1a.emf"), width = 5, height = 4)
+
+
+```
+
+Calculate correlations and return list of correlated and anti-correlated genes per LincRNA
+```{r get_correlations_MALAT1 for T cells, warning=FALSE}
+
+gene_name<-"MALAT1"
+# Start the clock!
+ptm <- proc.time()
+
+fn_get_corr_mat(seuratObj, gene_name)
+
+# Stop the clock
+time_taken<- proc.time() - ptm
+
+print(paste0("Time elapsed: ", sprintf((time_taken[3]/60), fmt = '%#.2f')," minutes"))
+
+head(list_corr_mat[[paste0("corr_", gene_name)]],20)
+head(list_corr_mat[[paste0("acorr_", gene_name)]],20)
+
+write.table(list_corr_mat[[paste0("corr_", gene_name)]], file = paste0(exp_path,"all_corr_",gene_name,".csv"), sep=",", row.names = FALSE)
+
+write.table(list_corr_mat[[paste0("acorr_", gene_name)]], file = paste0(exp_path, "all_acorr_",gene_name,".csv"), sep=",", row.names = FALSE)
+
+rm(list_corr_mat)
+```
+
+Calculate correlations and return list of correlated and anti-correlated genes per LincRNA
+```{r get_correlations_MALAT1 for CD4 cells, warning=FALSE}
+gene_name<-"MALAT1"
+seuratObj_CD4subset <- seuratObj
+seuratObj_CD4subset <- SetIdent(seuratObj_CD4subset, value=seuratObj_CD4subset$CellType1)
+seuratObj_CD4subset <- subset(seuratObj_CD4subset, idents = c("CD4_EM", "CD4_N", "CD4_TH1", "CD4_TH17", "CD4_Treg"))
+
+seuratObj_CD4subset <- SetIdent(seuratObj_CD4subset, value=seuratObj_CD4subset$seurat_clusters)
+
+# Start the clock!
+ptm <- proc.time()
+
+list_corr_mat<-fn_get_corr_mat(seuratObj_CD4subset, gene_name)
+
+# Stop the clock
+time_taken<- proc.time() - ptm
+
+print(paste0("Time elapsed: ", sprintf((time_taken[3]/60), fmt = '%#.2f')," minutes"))
+
+head(list_corr_mat[[paste0("corr_", gene_name)]],20)
+head(list_corr_mat[[paste0("acorr_", gene_name)]],20)
+
+write.table(list_corr_mat[[paste0("corr_", gene_name)]], file = paste0(exp_path,"CD4_corr_",gene_name,".csv"), sep=",", row.names = FALSE)
+
+write.table(list_corr_mat[[paste0("acorr_", gene_name)]], file = paste0(exp_path, "CD4_acorr_",gene_name,".csv"), sep=",", row.names = FALSE)
+
+rm(list_corr_mat)
+```
+
+```{r get_correlations_MALAT1 for CD8 cells, warning=FALSE}
+gene_name<-"MALAT1"
+seuratObj_CD8subset <- seuratObj
+seuratObj_CD8subset <- SetIdent(seuratObj_CD8subset, value=seuratObj_CD8subset$CellType1)
+seuratObj_CD8subset <- subset(seuratObj_CD8subset, idents = c("CD8_EM", "CD8_N", "CD8_EMRA", "CD8_EX", "CD8_gdT", "CD8_MAIT", "CD8_RM"))
+#seuratObj_CD8_EXsubset <- subset(seuratObj_CD8subset, idents = c("CD8_EX"))
+
+seuratObj_CD8subset <- SetIdent(seuratObj_CD8subset, value=seuratObj_CD8subset$seurat_clusters)
+#seuratObj_CD8_EXsubset <- SetIdent(seuratObj_CD8_EXsubset, value=seuratObj_CD8subset$seurat_clusters)
+
+# Start the clock!
+ptm <- proc.time()
+
+list_corr_mat<-fn_get_corr_mat(seuratObj_CD8subset, gene_name)
+
+# Stop the clock
+time_taken<- proc.time() - ptm
+
+print(paste0("Time elapsed: ", sprintf((time_taken[3]/60), fmt = '%#.2f')," minutes"))
+
+head(list_corr_mat[[paste0("corr_", gene_name)]],20)
+head(list_corr_mat[[paste0("acorr_", gene_name)]],20)
+
+write.table(list_corr_mat[[paste0("corr_", gene_name)]], file = paste0(exp_path,"CD8_corr_",gene_name,".csv"), sep=",", row.names = FALSE)
+
+write.table(list_corr_mat[[paste0("acorr_", gene_name)]], file = paste0(exp_path, "CD8_acorr_",gene_name,".csv"), sep=",", row.names = FALSE)
+
+rm(list_corr_mat)
+```
+
+
+```{r heatmap MALAT affected CD4}
+#Re-clustering CD4 cells
+corr_malat_CD4<-read.csv(paste0(exp_path, "CD4_corr_MALAT1.csv"))
+top_corr_malat<- head(corr_malat_CD4$gene, 20)
+
+acorr_malat_CD4<-read.csv(paste0(exp_path, "CD4_acorr_MALAT1.csv"))
+top_acorr_malat<- head(acorr_malat_CD4$gene, 20)
+
+seuratObj_CD4subset<-ScaleData(seuratObj_CD4subset)
+
+pdf(paste0(exp_path, "heatmap_malat_corr_CD4.pdf"), width = 6, height = 6)
+  DoHeatmap(seuratObj_CD4subset, features = c(top_corr_malat, top_acorr_malat), raster = TRUE, label = TRUE, angle = 0, size = 3) + NoLegend()
+  DoHeatmap(seuratObj_CD4subset, features = c(top_corr_malat, top_acorr_malat), raster = TRUE, label = TRUE, group.by = "CellType1", angle = 45, size = 2) + NoLegend()
+dev.off()
+```
+
+```{r heatmap MALAT affected CD8}
+
+seuratObj_CD8subset <- SetIdent(seuratObj_CD8subset, value=seuratObj_CD8subset$seurat_clusters)
+
+corr_malat_CD8<-read.csv(paste0(exp_path, "CD8_corr_MALAT1.csv"))
+top_corr_malat<- head(corr_malat_CD8$gene, 20)
+
+acorr_malat_CD8<-read.csv(paste0(exp_path, "CD8_acorr_MALAT1.csv"))
+top_acorr_malat<- head(acorr_malat_CD8$gene, 20)
+
+seuratObj_CD8subset<-ScaleData(seuratObj_CD8subset)
+
+pdf(paste0(exp_path, "heatmap_malat_corr_CD8.pdf"), width = 6, height = 6)
+  DoHeatmap(seuratObj_CD8subset, features = c(top_corr_malat, top_acorr_malat), raster = TRUE, label = TRUE, angle = 0, size = 3) + NoLegend()
+  DoHeatmap(seuratObj_CD8subset, features = c(top_corr_malat, top_acorr_malat), raster = TRUE, label = TRUE, group.by = "CellType1", angle = 45, size = 2) + NoLegend()
+dev.off()
+```
+
+```{r venn_diagram}
+Fig2B<-VennDiagram::venn.diagram(
+  x = c(as.data.frame(acorr_malat_CD4$gene),as.data.frame(acorr_malat_CD8$gene),as.data.frame(corr_malat_CD4$gene),as.data.frame(corr_malat_CD8$gene)), 
+  main.cex = 1,
+  sub.cex = 1,
+  cat.cex = 1.3,
+  cex = 2,
+  category.names = c("Acorr(CD4)","Acorr(CD8)","Corr(CD4)","Corr(CD8)"),
+  filename = NULL,
+  #filename = paste0(exp_path, "Fig2B.png"),
+  fill = c("yellow", "orange","purple", "violet"),
+  lty = "blank",
+  output=TRUE
+)
+pdf(paste0(exp_path, "Figure2B_Venn.pdf"))
+  grid.draw(Fig2B)
+dev.off()
+
+
+#top 50 only
+VennDiagram::venn.diagram(
+  x = c(as.data.frame(head(acorr_malat_CD4$gene,50)),as.data.frame(head(acorr_malat_CD8$gene,50)),as.data.frame(head(corr_malat_CD4$gene, 50)),as.data.frame(head(corr_malat_CD8$gene,50))), main.cex = 0.3,
+  category.names = c("Acorr(CD4)","Acorr(CD8)","Corr(CD4)","Corr(CD8)"),
+  filename = paste0(exp_path, "top100_CD4_CD8_anti_common"),
+  fill = c("yellow", "orange","purple", "violet"),
+  lty = "blank",
+  output=TRUE
+)
+```
+Fetch and save common genes
+```{r common_genes }
+#fetch intersection and unique genes 
+##########anti-correlated to MALAT1##############################
+#cd4 unique anti-correlated
+unique_acorr_malat_CD4 <- sqldf("SELECT * 
+                                FROM acorr_malat_CD4
+                                WHERE gene NOT IN (SELECT gene
+                                                   FROM acorr_malat_CD8)")
+write.csv(unique_acorr_malat_CD4, paste0(exp_path, "unique_acorr_malat_CD4.csv"))
+#CD8 unique anti-correlated
+unique_acorr_malat_CD8 <- sqldf("SELECT * 
+                                FROM acorr_malat_CD8
+                                WHERE gene NOT IN (SELECT gene
+                                                   FROM acorr_malat_CD4)")
+write.csv(unique_acorr_malat_CD8, paste0(exp_path, "unique_acorr_malat_CD8.csv"))
+
+#CD4 CD8 common anti-correlated
+common_acorr_malat_CD4_CD8 <- sqldf("SELECT *
+                                     FROM acorr_malat_CD8
+                                     WHERE gene IN (SELECT gene
+                                                    FROM acorr_malat_CD4)")
+write.csv(common_acorr_malat_CD4_CD8, paste0(exp_path, "common_acorr_malat_CD4_CD8.csv"))
+##########end###############################################
+##########correlated to MALAT1##############################
+unique_corr_malat_CD4 <- sqldf("SELECT * 
+                                FROM corr_malat_CD4
+                                WHERE gene NOT IN (SELECT gene
+                                                   FROM corr_malat_CD8)")
+write.csv(unique_corr_malat_CD4, paste0(exp_path, "unique_corr_malat_CD4.csv"))
+#CD8 unique anti-correlated
+unique_corr_malat_CD8 <- sqldf("SELECT * 
+                                FROM corr_malat_CD8
+                                WHERE gene NOT IN (SELECT gene
+                                                   FROM corr_malat_CD4)")
+write.csv(unique_corr_malat_CD8, paste0(exp_path, "unique_corr_malat_CD8.csv"))
+
+#CD4 CD8 common anti-correlated
+common_corr_malat_CD4_CD8 <- sqldf("SELECT *
+                                     FROM corr_malat_CD8
+                                     WHERE gene IN (SELECT gene
+                                                    FROM corr_malat_CD4)")
+write.csv(common_corr_malat_CD4_CD8, paste0(exp_path, "common_corr_malat_CD4_CD8.csv"))
+##########end###############################################
+```
+
+
+```{r figure_4_validations}
+#GO TO gse158127v1.Rmd
+```
+
+```{r cell_cycle_scoring}
+DefaultAssay(seuratObj) <- "SCT"
+#GO T
+#CellCycleScoring for entire object
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+seuratObj <- CellCycleScoring(seuratObj, s.features = s.genes, g2m.features = g2m.genes)
+
+FeatureScatter(seuratObj, feature1 = "S.Score", feature2 = "G2M.Score")
+
+all_cells <- FeatureScatter(seuratObj, feature1 = "S.Score", feature2 = "MALAT1", group.by = "Phase") + NoLegend() +
+  FeatureScatter(seuratObj, feature1 = "G2M.Score", feature2 = "MALAT1", group.by = "Phase")
+
+VlnPlot(seuratObj, features = "MALAT1", group.by = "Phase" ) + NoLegend()
+
+FeatureScatter(seuratObj, feature1 = "MKI67", feature2 = "MALAT1")
+
+prolif_seuratObj <- seuratObj
+# prolif_seuratObj <- subset(seuratObj, idents = "2")
+#prolif_seuratObj <- SetIdent(prolif_seuratObj, value = "Phase") 
+G2M_seuratObj <- subset(prolif_seuratObj, subset = S.Score > 0)
+S_seuratObj <- subset(prolif_seuratObj, subset = G2M.Score > 0)
+seuratObj <- SetIdent(prolif_seuratObj, value = "seurat_clusters") 
+
+G2MS_cells <- FeatureScatter(S_seuratObj, feature1 = "S.Score", feature2 = "MALAT1", group.by = "Phase")  +
+  FeatureScatter(G2M_seuratObj, feature1 = "G2M.Score", feature2 = "MALAT1", group.by = "Phase")
+
+
+
+
+
+prolif_seuratObj <- subset(seuratObj, idents = 2)
+
+dims_to_use<-15
+DefaultAssay(prolif_seuratObj) <- "integrated"
+prolif_seuratObj <- RunPCA(prolif_seuratObj, verbose = FALSE)
+prolif_seuratObj <- FindNeighbors(prolif_seuratObj, reduction = "pca", dims = 1:dims_to_use)
+prolif_seuratObj <- FindClusters(prolif_seuratObj, verbose = FALSE, resolution = 0.3)
+prolif_seuratObj <- RunUMAP(prolif_seuratObj, reduction = "pca", dims = 1:dims_to_use)
+DimPlot(prolif_seuratObj)+ FeaturePlot(prolif_seuratObj, features = c("MKI67"))+ FeaturePlot(prolif_seuratObj, features = c("MALAT1"))
+
+prolif_seuratObj <- PrepSCTFindMarkers(object = prolif_seuratObj)
+
+prolif_seuratObj.cluster.markers <- FindAllMarkers(prolif_seuratObj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+prolif_seuratObj.cluster.markers %>%
+  group_by(cluster) %>%
+    slice_max(n = 2, order_by = avg_log2FC)
+
+prolif_seuratObj.cluster.markers %>%
+  group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(prolif_seuratObj, features = top10$gene) + NoLegend() + theme(text = element_text(size = 4))
+# Cluster_0	Cluster_1	Cluster_2	Cluster_3	Cluster_4	Cluster_5	Cluster_6
+# CCDC114	TMEM173	ARL6IP1	CLEC4E	FP671120.4	IFNG-AS1	HSP90B1
+# KLRD1	CD40LG	HMMR	HLX	AP001267.3	THBS1	JCHAIN
+# MATK	ICOS	AASS	MTMR11	AC114490.3	PAIP2B	FKBP11
+# CTSW	CAMK2N1	TPX2	IFITM3	HIST1H2BG	CTSL	IGHV4-34
+# DDIT3	RAB11FIP5	CENPE	TRIO	SRGAP3	SYNM	MZB1
+# HOPX	RGS1	CDCA2	TTLL11	HIST2H2BE	MMP19	IGLC3
+# DBN1	CTLA4	CKS2	SMIM25	CCDC170	FTL	IGHG4
+# PSAT1	L1CAM	CD27	IL1RN	CSGALNACT1	TIMP1	IGHG1
+# MCM7	PEG10	GASAL1	S100A12	LRP5L	VPS13A-AS1	IGLV3-19
+# GZMK	DUSP4	KNL1	LRRK2	BEX1	GNLY	XBP1
+
+write.csv(prolif_seuratObj.cluster.markers, paste0(exp_path, "prolif_markers_per_ident.csv"))
+
+
+cd4_prolif<-subset(prolif_seuratObj, subset=CD4>0)
+FeatureScatter(cd4_prolif, feature1="MALAT1", feature2 = "MKI67")
+```
+

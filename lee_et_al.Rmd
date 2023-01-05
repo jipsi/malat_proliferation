@@ -1,0 +1,314 @@
+---
+title: "Down-regulation of MALAT1 is a hallmark of tissue and peripheral proliferative T cells in COVID-19"
+author: "Shoumit Dey"
+date: "29/08/2020"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+GSE149689
+Source: https://immunology.sciencemag.org/content/5/49/eabd1554.full
+```{r message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+exp_path<-"./"
+paper_key<-"149689"
+knitr::opts_knit$set(root.dir=exp_path)
+library(Seurat)
+library(dplyr)
+library(spatstat)
+library(gplots)
+library(corrplot)
+library(stringr)
+library(sqldf)
+library(VennDiagram)
+library(reshape2)
+library(ggplot2)
+```
+
+```{r}
+seuratObjList<-list()
+seuratObjList[["all_CD4_pbmc"]]<-readRDS(paste0(exp_path,"CD4_Tcells.rds"))
+seuratObjList[["all_CD8_pbmc"]]<-readRDS(paste0(exp_path,"CD8_Tcells.rds")) 
+
+
+
+#gse149689<-merge(all_CD4_pbmc, all_CD8_pbmc)
+#subset if needed
+#       identity    number of cells
+# 1 asymptomatic        1439
+# 2          flu        2522
+# 3      healthy        5415
+# 4         mild        4444
+# 5       severe        1573
+
+```
+
+Integrate dataset using CCA
+```{r find_integration_anchors}
+
+##perform standard preprocessing on each object
+for (i in 1:length(seuratObjList)) {
+  seuratObjList[[i]]
+  seuratObjList[[i]] <- PercentageFeatureSet(seuratObjList[[i]], pattern = "^MT-", col.name = "percent.mt")
+  seuratObjList[[i]] <- subset(seuratObjList[[i]], subset = percent.mt < 10)
+  seuratObjList[[i]] <- PercentageFeatureSet(seuratObjList[[i]], pattern = "^RPS", col.name = "percent.rps")
+  seuratObjList[[i]] <- PercentageFeatureSet(seuratObjList[[i]], pattern = "^RPL", col.name = "percent.rpl")
+}
+
+#SCTransform the seurat objects 
+seuratObjList <- lapply(X = seuratObjList, FUN = SCTransform, method = "glmGamPoi", 
+                        vars.to.regress = c(
+                          "percent.mt",
+                          "percent.rps",
+                          "percent.rpl",
+                          "nCount_RNA",
+                          "nFeature_RNA"
+                          ), verbose = TRUE)
+
+
+#Start integration workflow 
+features <- SelectIntegrationFeatures(object.list = seuratObjList, nfeatures = 3000)
+seuratObjList <- PrepSCTIntegration(object.list = seuratObjList, anchor.features = features)
+
+immune.anchors <- FindIntegrationAnchors(object.list = seuratObjList, normalization.method = "SCT", 
+                                         anchor.features = features)
+
+gse149689 <- IntegrateData(anchorset = immune.anchors, normalization.method = "SCT")#, features.to.integrate = all.feature)
+
+nrow(gse149689[["integrated"]]@scale.data)
+
+
+```
+
+Cluster & check for proliferating T cells - For figure 4
+```{r}
+#gse149689<-NormalizeData(gse149689)
+#gse149689 <- SCTransform(gse149689, vars.to.regress = c("nCount_RNA","nFeature_RNA"), verbose = FALSE)
+#Scaling the data - linear transformation
+all.genes <- rownames(gse149689)
+
+#gse149689 <- ScaleData(gse149689, features = all.genes)
+#gse149689[["scale.data"]] <- gse149689[["RNA"]]
+
+gse149689 <- RunPCA(gse149689)#, features = VariableFeatures(object=gse149689))
+#
+print(gse149689[["pca"]], dims = 1:5, nfeatures = 5)
+#
+VizDimLoadings(gse149689, dims = 1:2, reduction = "pca")
+#
+DimPlot(gse149689, reduction = "pca")
+
+ElbowPlot(gse149689)
+
+dims=15
+
+gse149689 <- FindNeighbors(gse149689, dims = 1:dims)
+#
+gse149689 <- FindClusters(gse149689, resolution = 0.2)
+
+gse149689 <- RunUMAP(gse149689, dims = 1:dims)
+
+DimPlot(gse149689)
+############################################################
+saveRDS(gse149689, paste0(exp_path,"GSE149689_T.rds"))
+```
+
+```{r figure4}
+pdf("fig4_lee.pdf")
+
+  FeaturePlot(gse149689, features = c("CD3D","CD4","CD8A"))
+  
+  
+  x<-DimPlot(gse149689, label = TRUE, label.box = TRUE) + NoLegend() + ggtitle("Lee et al")
+  #y<-FeaturePlot(gse149689, features = c("MALAT1","MKI67"))
+  y<-DimPlot(gse149689, group.by = "orig.ident") + 
+       #NoLegend() +
+       ggtitle("Lee et al")
+  
+  
+  
+  
+  FeaturePlot(gse149689, features = c("MALAT1","MKI67"))
+  
+  VlnPlot(gse149689, features = c("MALAT1","MKI67"))
+  
+  FeatureScatter(gse149689, feature1 = "MALAT1", feature2 = "MKI67", pt.size = 1)
+  
+  
+  gse149689_12 <- subset(gse149689, idents="12")
+  
+  DimPlot(gse149689_12)
+  
+  x6<-FeaturePlot(gse149689_12, features = c("MALAT1","MKI67"))
+  
+  VlnPlot(gse149689_12, features = c("MALAT1","MKI67"))
+  
+  y6<-FeatureScatter(gse149689_12, feature1 = "MALAT1", feature2 = "MKI67", pt.size = 1)
+  
+  ggarrange(x,y,x6,y6, ncol = 2, nrow = 2)
+
+dev.off()
+# gse149689.anchors <- FindTransferAnchors(reference = seuratObj, query = gse149689,
+#     dims = 1:30, reference.reduction = "pca", recompute.residuals = FALSE)
+# predictions <- TransferData(anchorset = gse149689.anchors, refdata = seuratObjList[["lambrechts_T"]]$CellType1,
+#     dims = 1:30)
+# gse149689 <- AddMetaData(gse149689, metadata = predictions)
+# gse149689$CellType1 <- gse149689$predicted.id
+
+```
+
+```{r AU_cell prep}
+#for graph saving reference
+study<-"gse149689"
+#get count data
+exprMatrix <- gse149689[['RNA']]@data
+
+cellsUMAP<-gse149689@reductions[["umap"]]@cell.embeddings
+plot(cellsUMAP, pch=16, cex=.3)
+#load gmt file
+gmtFile <- "gene_lists_auc.gmt"
+
+geneSets <- getGmt(gmtFile)
+#Let's check how many of these genes are in the expression matrix:
+geneSets <- subsetGeneSets(geneSets, rownames(exprMatrix)) 
+cbind(nGenes(geneSets))
+
+#To ease the interpretation of the tutorial, we will also add the gene-set size into its name:
+geneSets <- setGeneSetNames(geneSets, newNames=paste(names(geneSets), " (", nGenes(geneSets) ,"g)", sep=""))
+
+# Random
+set.seed(321)
+extraGeneSets <- c(
+  GeneSet(sample(rownames(exprMatrix), 50), setName="Random (50g)"),
+  GeneSet(sample(rownames(exprMatrix), 500), setName="Random (500g)"))
+
+countsPerGene <- apply(exprMatrix, 1, function(x) sum(x>0))
+# Housekeeping-like
+extraGeneSets <- c(extraGeneSets,
+                   GeneSet(sample(names(countsPerGene)[which(countsPerGene>quantile(countsPerGene, probs=.95))], 100), setName="HK-like (100g)"))
+
+geneSets <- GeneSetCollection(c(geneSets,extraGeneSets))
+names(geneSets)
+
+gc()
+```
+
+
+```{r AU_Cell build rankings, calculate AUC & explore thresholds }
+#build rankings
+cells_rankings <- AUCell_buildRankings(exprMatrix, nCores=1, plotStats=TRUE)
+cells_rankings
+#calculate AUC
+cells_AUC <- AUCell_calcAUC(geneSets, cells_rankings)
+#explore thresholds
+par(mfrow=c(3,3)) 
+  cells_assignment <- AUCell_exploreThresholds(cells_AUC, plotHist=TRUE, assign=TRUE) 
+  warningMsg <- sapply(cells_assignment, function(x) x$aucThr$comment)
+  warningMsg[which(warningMsg!="")]
+```
+
+```{r select thresholds and graph}
+selectedThresholds <- getThresholdSelected(cells_assignment)
+selectedThresholds[1] <-  0.42
+selectedThresholds[2] <-  0.25
+selectedThresholds[3] <-  0.18
+selectedThresholds[4] <-  0.32
+selectedThresholds[5] <-  0.3
+selectedThresholds[6] <-  0.25
+selectedThresholds[7] <-  0.02
+selectedThresholds[8] <-  0.035
+selectedThresholds[9] <-  0.35
+# selectedThresholds[10] <-  0.5
+# selectedThresholds[11] <-  0.02
+# selectedThresholds[12] <-  0.04
+# selectedThresholds[13] <-  0.4
+
+type<-"selected"
+
+# pdf("D:/GoogleDrive/spatial_leishmania/spatial/SingleCellAnalysis/human/Covid-19/combined/Fig4A_gse149689.pdf")
+  # par(mfrow=c(3,3))
+  AUCell_plotTSNE(tSNE=cellsUMAP, exprMat=exprMatrix, cellsAUC=cells_AUC[1:9,], thresholds=selectedThresholds)
+# dev.off()
+
+save_auc_values<-data.frame(t(cells_AUC@assays@data@listData[["AUC"]]))
+save_auc_values$barcodes<-rownames(save_auc_values)
+#save_auc_values$CD4_all_anti_124g<-save_auc_values$CD4_all_anti..124g.
+
+gse149689 <- AddMetaData(gse149689, save_auc_values)
+
+```
+
+
+```{r prep_figure4_figures_here}
+#downsample gse149689 to the lowest orig.ident
+min(table(gse149689$orig.ident))
+gse149689 <- SetIdent(gse149689, value = "orig.ident")
+gse149689.small <- subset(gse149689, downsample = min(table(gse149689$orig.ident)))
+gse149689.small$orig.ident <- factor(x = gse149689.small$orig.ident, levels = c("healthy", "asymptomatic", "mild", "severe", "flu"))
+gse149689 <- SetIdent(gse149689, value = "seurat_clusters")
+gse149689.small <- SetIdent(gse149689.small, value = "seurat_clusters")
+#Fig4
+hist(gse149689$CD4_CD8_acorr_common..99g., 
+     col="lightblue1",
+     freq = FALSE,
+     main = "Area under curve - gene list",
+     xlab="AUC values (CD4/CD8 MALAT1 acorr - 99 genes)", 
+     ylab = "Density")
+lines(density(gse149689$CD4_CD8_acorr_common..99g.))
+polygon(density(gse149689$CD4_CD8_acorr_common..99g.), col=rgb(1,0,1,.2))
+        
+
+#Fig4b
+auc_plot <- FeaturePlot(gse149689.small, features = c("CD4_CD8_acorr_common..99g."), split.by = "orig.ident", min.cutoff = selectedThresholds[1], cols = c("grey", "red"))
+auc_plot[[1]] + (auc_plot[[2]] + labs(y="")) + (auc_plot[[3]] + labs(y="")) 
+auc_plot[[4]] + (auc_plot[[5]] + labs(y="")) + (FeaturePlot(gse149689.small, features = "MKI67") + labs(y=""))
+#auc_plot <- auc_plot + ggtitle(label = "Area under curve", subtitle = "CD4/CD8 MALAT1 acorr (99 genes)") + NoLegend()
+```
+
+```{r exploring_proliferative_cells}
+DefaultAssay(gse149689) <- "integrated"
+#Take cells that have a high AUC score
+gse149689_AUC_pos <- subset(gse149689, subset = CD4_CD8_acorr_common..99g. > 0.42)
+
+#Scaling the data - linear transformation
+all.genes <- rownames(gse149689_AUC_pos)
+
+gse149689_AUC_pos <- FindVariableFeatures(gse149689_AUC_pos, selection.method = "vst")
+
+gse149689_AUC_pos <- ScaleData(gse149689_AUC_pos, features = all.genes)
+#gse149689_AUC_pos[["scale.data"]] <- gse149689_AUC_pos[["RNA"]]
+
+gse149689_AUC_pos <- RunPCA(gse149689_AUC_pos, features = VariableFeatures(object=gse149689_AUC_pos))
+#
+print(gse149689_AUC_pos[["pca"]], dims = 1:5, nfeatures = 5)
+#
+VizDimLoadings(gse149689_AUC_pos, dims = 1:2, reduction = "pca")
+#
+DimPlot(gse149689_AUC_pos, reduction = "pca")
+
+ElbowPlot(gse149689_AUC_pos)
+
+gse149689_AUC_pos <- FindNeighbors(gse149689_AUC_pos, dims = 1:10)
+#
+gse149689_AUC_pos <- FindClusters(gse149689_AUC_pos, resolution = 0.4)
+
+gse149689_AUC_pos <- RunUMAP(gse149689_AUC_pos, dims = 1:10)
+
+DimPlot(gse149689_AUC_pos, label = TRUE, label.box = TRUE) 
+
+DimPlot(gse149689_AUC_pos, group.by = "orig.ident")
+VlnPlot(gse149689_AUC_pos,features = "MALAT1")
+```
+
+```{r cell_cycle}
+#CellCycleScoring for entire object
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+gse149689_AUC_pos <- CellCycleScoring(gse149689_AUC_pos, s.features = s.genes, g2m.features = g2m.genes)
+
+VlnPlot(gse149689_AUC_pos, features = "MALAT1", group.by = "Phase" ) + NoLegend()
+FeatureScatter(gse149689_AUC_pos, feature1 = "MKI67", feature2 = "MALAT1")
+auc_pos_cells <- FeatureScatter(gse149689_AUC_pos, feature1 = "S.Score", feature2 = "MALAT1", group.by = NULL) + NoLegend() +
+  FeatureScatter(gse149689_AUC_pos, feature1 = "G2M.Score", feature2 = "MALAT1", group.by = NULL) +  theme(axis.text.y = element_blank(), axis.title.y = element_blank(), axis.ticks.y = element_blank(), panel.background=element_rect(fill = "white") )
+
+```
