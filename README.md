@@ -16,6 +16,8 @@ T cells play key protective but also pathogenic roles in COVID-19. We studied ex
 
 ### Currently available as a pre-print on medRxiv - https://www.medrxiv.org/content/10.1101/2023.01.06.23284229v1
 
+### Now published on Clinical & Experimental Immunology -  https://doi.org/10.1093/cei/uxad034
+
 # Code for replicating figures 
 - Rds files not available in Github but provided separately here at https://doi.org/10.5281/zenodo.7506637. These contain all processed/unprocessed Rds files required to run the code files in this repository.
 - All Rds files in the code are generated from publicly available datasets as described in the Methods section of the paper.
